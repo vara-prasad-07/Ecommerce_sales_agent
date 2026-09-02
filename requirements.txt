@@ -1,0 +1,13 @@
+livekit-agents[sarvam]~=1.0
+sarvamai
+livekit-api
+livekit-plugins-noise-cancellation~=0.2
+python-dotenv
+aiosqlite
+python-dateutil
+tzdata
+twilio
+# Used directly by scripts/test_conversation_text.py, which talks to
+# Sarvam's OpenAI-compatible chat completions endpoint for fast text-mode
+# iteration without any telephony cost.
+openai
