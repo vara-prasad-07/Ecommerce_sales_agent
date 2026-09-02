@@ -390,6 +390,31 @@ class TwilioWhatsAppTemplateTests(unittest.TestCase):
         self.assertEqual(agent._mid_call_tones_sent, {"hot"})
 
     @patch("agent.main.storage.set_discovery", new_callable=AsyncMock)
+    def test_update_discovery_rejects_literal_null_and_similar_non_answers(self, mock_set_discovery):
+        """Regression test: a real call had the LLM pass the literal string
+        "null" for fields it didn't have an answer for, which then leaked
+        verbatim into a real WhatsApp message ("sells: null; catalog size:
+        null..."). update_discovery must treat these as no answer, same as
+        an empty string."""
+        from agent.main import ElevateBoxSalesAgent
+
+        agent = ElevateBoxSalesAgent("call-null-1", None)
+
+        asyncio.run(
+            agent.update_discovery(
+                None,
+                category="null",
+                catalog_size="None",
+                timeline="n/a",
+                features="not discussed",
+                budget="1 lakh INR",
+            )
+        )
+
+        self.assertEqual(agent._discovery_context(), "budget: 1 lakh INR")
+        self.assertNotIn("null", agent._discovery_context().lower())
+
+    @patch("agent.main.storage.set_discovery", new_callable=AsyncMock)
     def test_update_discovery_tracks_structured_fields(self, mock_set_discovery):
         from agent.main import ElevateBoxSalesAgent
 

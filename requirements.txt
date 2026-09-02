@@ -7,6 +7,9 @@ aiosqlite
 python-dateutil
 tzdata
 twilio
+# Web trigger (server/app.py) — password-gated "call this number now" page
+fastapi
+uvicorn[standard]
 # Used directly by scripts/test_conversation_text.py, which talks to
 # Sarvam's OpenAI-compatible chat completions endpoint for fast text-mode
 # iteration without any telephony cost.

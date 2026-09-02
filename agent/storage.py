@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS whatsapp_sends (
     sent_at REAL,
     success INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS call_triggers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone_number TEXT,
+    requested_by_ip TEXT,
+    ts REAL
+);
 """
 
 
@@ -141,6 +148,17 @@ async def record_whatsapp_send(call_id: str, kind: str, payload: dict, success: 
             "INSERT INTO whatsapp_sends (call_id, kind, payload, sent_at, success) "
             "VALUES (?, ?, ?, ?, ?)",
             (call_id, kind, json.dumps(payload), time.time(), int(success)),
+        )
+        await db.commit()
+
+
+async def record_call_trigger(phone_number: str, requested_by_ip: str):
+    """Audit log for the web trigger (server/app.py) — who requested a call
+    to what number, and when. Not used by the voice agent flow itself."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO call_triggers (phone_number, requested_by_ip, ts) VALUES (?, ?, ?)",
+            (phone_number, requested_by_ip, time.time()),
         )
         await db.commit()
 

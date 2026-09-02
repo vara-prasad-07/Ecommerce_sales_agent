@@ -1,0 +1,13 @@
+properties:
+  template:
+    containers:
+    - name: elevatebox-worker
+      image: elevateboxacr.azurecr.io/elevatebox-agent:latest
+      command:
+      - python
+      - -m
+      - agent.main
+      - start
+    scale:
+      minReplicas: 1
+      maxReplicas: 1

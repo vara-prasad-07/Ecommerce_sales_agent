@@ -33,7 +33,7 @@ from agent.prompts import build_system_prompt
 from agent import storage
 from agent.whatsapp import send_mid_call_message, send_post_call_summary
 from agent.scheduling import parse_callback_time, format_confirmation
-from agent.main import classify_caller_turn, LANGUAGE_TURN_HINTS
+from agent.main import classify_caller_turn, LANGUAGE_TURN_HINTS, _clean_discovery_value
 
 load_dotenv()
 
@@ -151,7 +151,7 @@ async def handle_tool_call(
 
     if name == "update_discovery":
         for field in DISCOVERY_LABELS:
-            value = (args.get(field) or "").strip()
+            value = _clean_discovery_value(args.get(field) or "")
             if value:
                 discovery[field] = value
         filled = sum(1 for v in discovery.values() if v)

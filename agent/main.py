@@ -65,6 +65,22 @@ DISCOVERY_LABELS = {
     "budget": "budget",
 }
 
+# The LLM occasionally passes the literal word "null" (or similar) instead
+# of just leaving a discovery field blank when it has nothing to report.
+# Confirmed in production: this leaked verbatim into a real WhatsApp message
+# ("sells: null; catalog size: null..."). Treat these as "no answer."
+_DISCOVERY_NON_ANSWERS = {
+    "null", "none", "n/a", "na", "unknown", "not discussed", "not mentioned",
+    "not applicable", "not specified", "-", "nil",
+}
+
+
+def _clean_discovery_value(value: str) -> str:
+    cleaned = (value or "").strip()
+    if not cleaned or cleaned.lower() in _DISCOVERY_NON_ANSWERS:
+        return ""
+    return cleaned
+
 
 def _has_required_discovery(call_context: str) -> bool:
     """Only trigger after the full discovery checklist is covered.
@@ -497,8 +513,9 @@ class ElevateBoxSalesAgent(Agent):
             ("features", features),
             ("budget", budget),
         ):
-            if value.strip():
-                self._discovery[field] = value.strip()
+            cleaned = _clean_discovery_value(value)
+            if cleaned:
+                self._discovery[field] = cleaned
 
         await storage.set_discovery(self.call_id, self._discovery)
         filled = self._discovery_filled_count()
@@ -742,12 +759,34 @@ async def entrypoint(ctx: JobContext):
         pending_turns.add(task)
         task.add_done_callback(pending_turns.discard)
 
-    @session.on("user_speech_committed")
-    def _on_user_speech(msg):
-        _track_turn(storage.log_turn(call_id, "caller", msg.content))
+    # NOTE: "user_speech_committed" / "agent_speech_committed" are not real
+    # events on this version of livekit-agents (1.7.x) — the actual events
+    # are "conversation_item_added" (both roles, once the turn is finalized)
+    # and "user_input_transcribed" (STT result, carries the detected
+    # language directly). session.on() doesn't validate event names, so the
+    # old handlers registered here silently never fired: no transcript turn
+    # was ever logged, and the per-turn TTS language switch below never ran
+    # on a single real call. Confirmed by every row in transcript_turns
+    # being empty across every call in call_data.db.
+    @session.on("conversation_item_added")
+    def _on_conversation_item(event):
+        item = event.item
+        role = getattr(item, "role", None)
+        text = getattr(item, "text_content", None)
+        if not text:
+            return
+        if role == "user":
+            _track_turn(storage.log_turn(call_id, "caller", text))
+        elif role == "assistant":
+            _track_turn(storage.log_turn(call_id, "agent", text))
 
-        spoken_text = getattr(msg, "content", "") or ""
-        detected_metadata = normalize_tts_language(getattr(msg, "language", "") or "")
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(event):
+        if not event.is_final:
+            return
+
+        spoken_text = event.transcript or ""
+        detected_metadata = normalize_tts_language(event.language or "")
         selected_locale = resolve_tts_language(spoken_text, detected_metadata)
 
         if selected_locale:
@@ -759,10 +798,6 @@ async def entrypoint(ctx: JobContext):
                     selected_locale,
                     "text" if detect_tts_language_from_text(spoken_text) != "en-IN" else "metadata or fallback",
                 )
-
-    @session.on("agent_speech_committed")
-    def _on_agent_speech(msg):
-        _track_turn(storage.log_turn(call_id, "agent", msg.content))
 
     async def _on_shutdown():
         if pending_turns:

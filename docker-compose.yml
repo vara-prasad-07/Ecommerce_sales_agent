@@ -1,0 +1,27 @@
+# Optional: run both processes together in containers, close to how they'll
+# run in Azure Container Apps. Not required for local development — your
+# normal venv workflow (python -m agent.main dev + uvicorn server.app:app
+# --reload) still works and is faster to iterate with.
+#
+#   docker compose up --build
+#
+services:
+  worker:
+    build: .
+    command: ["python", "-m", "agent.main", "start"]
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ./call_data.db:/app/call_data.db
+
+  web:
+    build: .
+    command: ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file: .env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    volumes:
+      - ./call_data.db:/app/call_data.db
+    depends_on:
+      - worker

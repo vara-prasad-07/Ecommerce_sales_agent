@@ -126,6 +126,37 @@ classification decisions as the call happens.
 
 ---
 
+## 7b. On-demand web trigger — call any number from a browser
+
+Instead of running `scripts/make_call.py` yourself, `server/app.py` serves a
+tiny password-gated web page: enter a phone number (with country code) and
+the shared password, and it dispatches the exact same call as the script
+above. This is what makes the prototype work "on demand" for someone who
+isn't you and doesn't have this repo — they just need the URL and the
+password.
+
+It's a separate, lightweight process from the agent worker — it only talks
+to the LiveKit API to kick off a call; it doesn't do any audio/STT/TTS/LLM
+itself. **The agent worker (Terminal 1 above) must still be running** for a
+triggered call to actually be answered.
+
+Set a password in `.env` first:
+```bash
+CALL_TRIGGER_PASSWORD=pick-something-only-you-know
+```
+
+**Terminal 2 — run the web trigger** (instead of `make_call.py`):
+```bash
+uvicorn server.app:app --reload --port 8000
+```
+Open `http://localhost:8000`, enter a number and the password, click
+**Call now**. A 30-second cooldown between triggers (configurable via
+`MIN_SECONDS_BETWEEN_CALLS`) stops the password, once known, from being used
+to spam calls. Every triggered call is logged to SQLite
+(`call_triggers` table: number, requester IP, timestamp) for an audit trail.
+
+---
+
 ## 8. What happens on a call
 
 1. `make_call.py` dispatches the agent into a fresh LiveKit room and dials
@@ -160,17 +191,23 @@ debugging and for writing your submission note.
 elevatebox-voice-agent/
 ├── .env.example              # copy to .env and fill in
 ├── requirements.txt
+├── Dockerfile                  # one image, used for both the worker and the web trigger
+├── docker-compose.yml            # optional local two-container run
 ├── call_data.db               # created automatically on first run
 ├── agent/
 │   ├── main.py                # LiveKit entrypoint, session setup, function tools
-│   ├── prompts.py              # the system prompt (persona/discovery/classification)
-│   ├── storage.py               # SQLite: calls, transcripts, discovery, classifications, callbacks
-│   ├── whatsapp.py               # Twilio WhatsApp template sender (mid-call + post-call)
-│   └── scheduling.py              # natural-language time phrase -> datetime
+│   ├── dispatch.py             # shared call-dispatch logic (used by make_call.py + server/app.py)
+│   ├── prompts.py                # the system prompt (persona/discovery/classification)
+│   ├── storage.py                 # SQLite: calls, transcripts, discovery, classifications, callbacks
+│   ├── whatsapp.py                 # Twilio WhatsApp template sender (mid-call + post-call)
+│   └── scheduling.py                # natural-language time phrase -> datetime
+├── server/
+│   ├── app.py                # FastAPI: password-gated "call this number now" web trigger
+│   └── static/index.html       # the trigger form
 ├── scripts/
 │   ├── setup_twilio_trunk.py       # (optional) automates the Twilio-side trunk setup
 │   ├── setup_sip_trunk.py           # creates the LiveKit outbound SIP trunk
-│   ├── make_call.py                  # dispatches agent + dials the target number
+│   ├── make_call.py                  # CLI: dispatches agent + dials a number
 │   ├── preflight_check.py             # validates all credentials before a real call
 │   └── test_conversation_text.py       # text-only debugging loop, no telephony cost
 └── templates/
@@ -209,7 +246,157 @@ elevatebox-voice-agent/
 
 ---
 
-## 11. Before you send this in
+## 11. Deploying to Azure
+
+This app has two long-running processes that both need to be up at the same
+time:
+
+- **worker** (`python -m agent.main start`) — connects to LiveKit and stays
+  registered as `elevatebox-sales-agent`, waiting to be dispatched. This is
+  a persistent background worker, not a request/response web service.
+- **web** (`uvicorn server.app:app`) — the password-gated trigger page from
+  section 7b. A normal stateless web service.
+
+**Azure Container Apps** is the best fit: it runs both as always-on
+containers without you managing a VM, and it's cheap to scale the web app to
+zero later if you want (the worker should stay at `min-replicas 1`, since it
+has to be connected and ready to receive a dispatch at all times).
+
+### One-time setup
+
+```bash
+az login
+az group create --name elevatebox-rg --location centralindia
+
+az acr create --resource-group elevatebox-rg --name elevateboxacr --sku Basic
+az acr login --name elevateboxacr
+
+az containerapp env create \
+  --name elevatebox-env \
+  --resource-group elevatebox-rg \
+  --location centralindia
+```
+
+### Build and push the image
+
+Run this from the repo root (where the `Dockerfile` is):
+```bash
+az acr build --registry elevateboxacr --image elevatebox-agent:latest .
+```
+`az acr build` builds in the cloud, so you don't need Docker installed
+locally — but `docker build . && docker push` to the same ACR works too if
+you already have Docker.
+
+### Push your secrets once, reference them everywhere
+
+Every value currently in your local `.env` needs to reach both containers.
+Don't put real secrets in plain `--env-vars`; register them as Container
+Apps secrets first, then reference them:
+
+```bash
+az containerapp env show --name elevatebox-env --resource-group elevatebox-rg \
+  --query id -o tsv   # sanity check the env exists
+
+# repeat --secrets for every var in .env.example (one command, many pairs):
+SECRETS="livekit-url=$LIVEKIT_URL livekit-api-key=$LIVEKIT_API_KEY livekit-api-secret=$LIVEKIT_API_SECRET \
+twilio-account-sid=$TWILIO_ACCOUNT_SID twilio-auth-token=$TWILIO_AUTH_TOKEN twilio-phone-number=$TWILIO_PHONE_NUMBER \
+twilio-whatsapp-from=$TWILIO_WHATSAPP_FROM livekit-sip-trunk-id=$LIVEKIT_SIP_TRUNK_ID \
+sarvam-api-key=$SARVAM_API_KEY whatsapp-recipient-number=$WHATSAPP_RECIPIENT_NUMBER \
+your-name=$YOUR_NAME your-phone-number=$YOUR_PHONE_NUMBER resume-public-url=$RESUME_PUBLIC_URL \
+architecture-diagram-url=$ARCHITECTURE_DIAGRAM_URL target-phone-number=$TARGET_PHONE_NUMBER \
+call-trigger-password=$CALL_TRIGGER_PASSWORD"
+```
+(Source your local `.env` into your shell first — `set -a; source .env; set +a`
+on macOS/Linux, or paste real values directly — then run the `az
+containerapp create` commands below with `--secrets $SECRETS`.)
+
+### Create the worker (always on, no public ingress)
+
+```bash
+az containerapp create \
+  --name elevatebox-worker \
+  --resource-group elevatebox-rg \
+  --environment elevatebox-env \
+  --image elevateboxacr.azurecr.io/elevatebox-agent:latest \
+  --registry-server elevateboxacr.azurecr.io \
+  --command "python" --args "-m" "agent.main" "start" \
+  --min-replicas 1 --max-replicas 1 \
+  --secrets $SECRETS \
+  --env-vars \
+    LIVEKIT_URL=secretref:livekit-url \
+    LIVEKIT_API_KEY=secretref:livekit-api-key \
+    LIVEKIT_API_SECRET=secretref:livekit-api-secret \
+    TWILIO_ACCOUNT_SID=secretref:twilio-account-sid \
+    TWILIO_AUTH_TOKEN=secretref:twilio-auth-token \
+    TWILIO_PHONE_NUMBER=secretref:twilio-phone-number \
+    TWILIO_WHATSAPP_FROM=secretref:twilio-whatsapp-from \
+    LIVEKIT_SIP_TRUNK_ID=secretref:livekit-sip-trunk-id \
+    SARVAM_API_KEY=secretref:sarvam-api-key \
+    WHATSAPP_RECIPIENT_NUMBER=secretref:whatsapp-recipient-number \
+    YOUR_NAME=secretref:your-name \
+    YOUR_PHONE_NUMBER=secretref:your-phone-number \
+    RESUME_PUBLIC_URL=secretref:resume-public-url \
+    ARCHITECTURE_DIAGRAM_URL=secretref:architecture-diagram-url \
+    TARGET_PHONE_NUMBER=secretref:target-phone-number
+```
+
+### Create the web trigger (public ingress on port 8000)
+
+```bash
+az containerapp create \
+  --name elevatebox-web \
+  --resource-group elevatebox-rg \
+  --environment elevatebox-env \
+  --image elevateboxacr.azurecr.io/elevatebox-agent:latest \
+  --registry-server elevateboxacr.azurecr.io \
+  --target-port 8000 --ingress external \
+  --min-replicas 1 --max-replicas 2 \
+  --secrets $SECRETS \
+  --env-vars \
+    LIVEKIT_URL=secretref:livekit-url \
+    LIVEKIT_API_KEY=secretref:livekit-api-key \
+    LIVEKIT_API_SECRET=secretref:livekit-api-secret \
+    LIVEKIT_SIP_TRUNK_ID=secretref:livekit-sip-trunk-id \
+    CALL_TRIGGER_PASSWORD=secretref:call-trigger-password \
+    MIN_SECONDS_BETWEEN_CALLS=30
+```
+(The web container only needs the LiveKit vars + the password — it never
+talks to Twilio/Sarvam directly, `dispatch_call` just asks LiveKit to
+dispatch the already-running worker.)
+
+The command prints a `.azurecontainerapps.io` URL when it finishes — that's
+your public trigger page.
+
+### Redeploying after a code change
+
+```bash
+az acr build --registry elevateboxacr --image elevatebox-agent:latest .
+az containerapp update --name elevatebox-worker --resource-group elevatebox-rg \
+  --image elevateboxacr.azurecr.io/elevatebox-agent:latest
+az containerapp update --name elevatebox-web --resource-group elevatebox-rg \
+  --image elevateboxacr.azurecr.io/elevatebox-agent:latest
+```
+
+### Notes specific to this app
+
+- `call_data.db` (SQLite) lives inside each container's filesystem, which
+  is ephemeral on Container Apps — a restart wipes it. Fine for the
+  assignment; if you want the audit trail (`call_triggers` table) and call
+  history to survive restarts, mount an Azure Files share at
+  `/app` (`az containerapp env storage set` + `--volume-mounts`) or move to
+  Azure Database for PostgreSQL later.
+- The worker has no public ingress — it's outbound-only (it connects out to
+  LiveKit Cloud), so don't set `--ingress` on it.
+- Double-check `WHATSAPP_RECIPIENT_NUMBER` and `TARGET_PHONE_NUMBER` are the
+  values you actually want live *before* deploying — once `elevatebox-web`
+  is public, anyone with the password (and, unless you lock it down,
+  anyone who can guess your app's URL and doesn't know the password gets a
+  401, not a call) can trigger a real outbound call and a real WhatsApp
+  send, which costs real money.
+
+---
+
+## 12. Before you send this in
 
 - [ ] Filled in every `.env` value, including `RESUME_PUBLIC_URL` and
       `ARCHITECTURE_DIAGRAM_URL` with real public links
@@ -226,3 +413,6 @@ elevatebox-voice-agent/
       `templates/architecture_diagram_prompt.md`) and hosted it publicly
 - [ ] Wrote your under-200-word note on what works / what doesn't / what
       you'd fix next
+- [ ] If sending the hosted web trigger link, confirmed `CALL_TRIGGER_PASSWORD`
+      is set to a real value (not blank) and tested triggering a call through
+      the deployed URL, not just locally

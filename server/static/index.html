@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ElevateBox — Call Trigger</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f5f2;
+    --card: #ffffff;
+    --text: #17171a;
+    --muted: #6b6b70;
+    --border: #e3e1db;
+    --accent: #17171a;
+    --accent-text: #ffffff;
+    --error: #b3261e;
+    --error-bg: #fbebe9;
+    --success: #14532d;
+    --success-bg: #e9f7ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121212;
+      --card: #1c1c1e;
+      --text: #f2f2f2;
+      --muted: #9a9a9e;
+      --border: #302f2f;
+      --accent: #f2f2f2;
+      --accent-text: #121212;
+      --error: #ff8a80;
+      --error-bg: #3a1f1d;
+      --success: #7fdb9a;
+      --success-bg: #16281d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 24px;
+  }
+  .card {
+    width: 100%;
+    max-width: 420px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 32px;
+  }
+  h1 {
+    font-size: 1.25rem;
+    margin: 0 0 4px;
+  }
+  p.subtitle {
+    color: var(--muted);
+    margin: 0 0 28px;
+    font-size: 0.9rem;
+  }
+  label {
+    display: block;
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+  input {
+    width: 100%;
+    padding: 11px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    font-size: 1rem;
+    margin-bottom: 18px;
+  }
+  input:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  button {
+    width: 100%;
+    padding: 12px;
+    border-radius: 8px;
+    border: none;
+    background: var(--accent);
+    color: var(--accent-text);
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .status {
+    margin-top: 16px;
+    padding: 12px 14px;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    display: none;
+  }
+  .status.error {
+    display: block;
+    background: var(--error-bg);
+    color: var(--error);
+  }
+  .status.success {
+    display: block;
+    background: var(--success-bg);
+    color: var(--success);
+  }
+  .hint {
+    color: var(--muted);
+    font-size: 0.78rem;
+    margin: -12px 0 18px;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Call me now</h1>
+    <p class="subtitle">Enter a number and the agent will call it right away.</p>
+
+    <form id="call-form">
+      <label for="phone">Phone number (with country code)</label>
+      <input id="phone" name="phone" type="tel" placeholder="+919876543210" autocomplete="tel" required />
+      <p class="hint">Include the country code, e.g. +91 for India.</p>
+
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required />
+
+      <button id="submit-btn" type="submit">Call now</button>
+    </form>
+
+    <div id="status" class="status" role="status"></div>
+  </div>
+
+  <script>
+    const form = document.getElementById("call-form");
+    const statusEl = document.getElementById("status");
+    const submitBtn = document.getElementById("submit-btn");
+
+    function showStatus(kind, message) {
+      statusEl.className = "status " + kind;
+      statusEl.textContent = message;
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const phone = document.getElementById("phone").value.trim();
+      const password = document.getElementById("password").value;
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = "Calling…";
+      statusEl.className = "status";
+
+      try {
+        const response = await fetch("/api/call", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ phone_number: phone, password }),
+        });
+        const data = await response.json();
+
+        if (!response.ok) {
+          showStatus("error", data.detail || "Something went wrong.");
+        } else {
+          showStatus("success", data.message);
+          document.getElementById("password").value = "";
+        }
+      } catch (err) {
+        showStatus("error", "Could not reach the server. Try again.");
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = "Call now";
+      }
+    });
+  </script>
+</body>
+</html>
