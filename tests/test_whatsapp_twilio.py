@@ -245,6 +245,40 @@ class TwilioWhatsAppTemplateTests(unittest.TestCase):
 
         self.assertEqual(_recipient_whatsapp_number(), "whatsapp:+917386696790")
 
+    @patch.dict(
+        os.environ,
+        {
+            "TWILIO_ACCOUNT_SID": "AC123",
+            "TWILIO_AUTH_TOKEN": "token123",
+            "TWILIO_WHATSAPP_FROM": "whatsapp:+14155238886",
+            "WHATSAPP_RECIPIENT_NUMBER": "+917658975169",
+            "YOUR_PHONE_NUMBER": "7658975169",
+            "YOUR_NAME": "Vara Prasad",
+        },
+        clear=True,
+    )
+    def test_callback_confirmation_uses_mid_call_template_and_mentions_whatsapp(self):
+        """Regression test: a caller who says "I don't have time, call me
+        later" and gets a callback booked must still get a WhatsApp
+        confirming the follow-up — sent on template 1, the same content SID
+        as the Hot/Cold mid-call send."""
+        from agent.whatsapp import send_callback_confirmation
+
+        with patch("agent.whatsapp.Client") as mock_client:
+            mock_client.return_value.messages.create.return_value = MagicMock()
+
+            success = asyncio.run(
+                send_callback_confirmation("", "Thursday at 10:00 AM", "Ramesh")
+            )
+
+            self.assertTrue(success)
+            create_kwargs = mock_client.return_value.messages.create.call_args.kwargs
+            self.assertEqual(create_kwargs["content_sid"], "HX0b5ef55c49ac598c27c41aaea7393634")
+            variables = json.loads(create_kwargs["content_variables"])
+            self.assertTrue(variables["2"].startswith("Hi Ramesh!"))
+            self.assertIn("WhatsApp", variables["2"])
+            self.assertIn("Thursday at 10:00 AM", variables["2"])
+
     def test_detect_tts_language_from_text_handles_romanized_telugu(self):
         from agent.main import detect_tts_language_from_text
 
@@ -388,6 +422,49 @@ class TwilioWhatsAppTemplateTests(unittest.TestCase):
         self.assertEqual(mock_send_mid_call_message.await_count, 1)
         self.assertTrue(agent._mid_call_whatsapp_sent)
         self.assertEqual(agent._mid_call_tones_sent, {"hot"})
+
+    @patch("agent.main.whatsapp.send_callback_confirmation", new_callable=AsyncMock)
+    @patch("agent.main.storage.record_whatsapp_send", new_callable=AsyncMock)
+    @patch("agent.main.storage.record_callback", new_callable=AsyncMock)
+    def test_book_callback_fires_whatsapp_even_with_no_discovery(
+        self,
+        mock_record_callback,
+        mock_record_whatsapp_send,
+        mock_send_callback_confirmation,
+    ):
+        """Regression test: a caller who cuts the call short with "I don't
+        have time, call me later" may bail before any discovery is
+        recorded. book_callback must still send the WhatsApp confirmation —
+        it must not depend on the Hot/Cold discovery-completeness gate."""
+        from agent.main import ElevateBoxSalesAgent
+
+        agent = ElevateBoxSalesAgent("call-callback-1", None)
+        mock_send_callback_confirmation.return_value = True
+
+        result = asyncio.run(agent.book_callback(None, "tomorrow morning"))
+
+        mock_send_callback_confirmation.assert_awaited_once()
+        self.assertTrue(agent._mid_call_whatsapp_sent)
+        self.assertIn("callback", agent._mid_call_tones_sent)
+        self.assertIn("WhatsApp", result)
+
+    @patch("agent.main.whatsapp.send_callback_confirmation", new_callable=AsyncMock)
+    @patch("agent.main.storage.record_whatsapp_send", new_callable=AsyncMock)
+    @patch("agent.main.storage.record_callback", new_callable=AsyncMock)
+    def test_book_callback_does_not_duplicate_an_already_sent_mid_call_whatsapp(
+        self,
+        mock_record_callback,
+        mock_record_whatsapp_send,
+        mock_send_callback_confirmation,
+    ):
+        from agent.main import ElevateBoxSalesAgent
+
+        agent = ElevateBoxSalesAgent("call-callback-2", None)
+        agent._mid_call_whatsapp_sent = True  # e.g. Hot mid-call WhatsApp already fired
+
+        asyncio.run(agent.book_callback(None, "next week"))
+
+        mock_send_callback_confirmation.assert_not_awaited()
 
     @patch("agent.main.storage.set_discovery", new_callable=AsyncMock)
     def test_update_discovery_rejects_literal_null_and_similar_non_answers(self, mock_set_discovery):

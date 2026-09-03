@@ -30,8 +30,15 @@ def _fmt_phone(raw: str) -> str:
     return f"+{digits}"
 
 
-def _recipient_whatsapp_number() -> str:
-    recipient = (os.getenv("WHATSAPP_RECIPIENT_NUMBER") or "").strip()
+def _recipient_whatsapp_number(call_phone_number: str = "") -> str:
+    """Prefer the number actually dialed for this call (passed in from the
+    job that placed it — e.g. the number typed into the "Call me now" form)
+    so the WhatsApp follow-up reaches the same person who was called. Falls
+    back to the fixed env vars only when no per-call number is known, which
+    keeps the old default-recipient behavior for manual/dev runs."""
+    recipient = (call_phone_number or "").strip()
+    if not recipient or recipient.lower() == "unknown":
+        recipient = (os.getenv("WHATSAPP_RECIPIENT_NUMBER") or "").strip()
     if not recipient:
         recipient = (os.getenv("TARGET_PHONE_NUMBER") or "").strip()
     if not recipient:
@@ -149,9 +156,58 @@ def _mid_call_template_message(context: str, tone: str, caller_name: str = "") -
     return f"Hi {name}! {body}" if name else body
 
 
-async def send_mid_call_message(context: str, tone: str, caller_name: str = "") -> bool:
+def _callback_template_message(context: str, confirmation: str, caller_name: str = "") -> str:
+    cleaned_context = _template_variable(
+        context,
+        "We had a good initial conversation about building an e-commerce site.",
+    )
+    closing = (
+        f"I'll send you the follow-up details right here on WhatsApp, and I'll call you back {confirmation}."
+        if confirmation
+        else "I'll send you the follow-up details right here on WhatsApp, and call you back soon."
+    )
+    body = f"{cleaned_context} {closing}".strip()
+    name = (caller_name or "").strip()
+    return f"Hi {name}! {body}" if name else body
+
+
+async def send_callback_confirmation(
+    context: str, confirmation: str, caller_name: str = "", call_phone_number: str = ""
+) -> bool:
+    """Send the template-1 (mid-call) WhatsApp confirming a just-booked callback.
+
+    Uses the same content template as the Hot/Cold mid-call send, but is not
+    gated on discovery being complete — a caller who says "I don't have time,
+    call me later" may bail out before discovery finishes, and they should
+    still get the "I'll send follow-up details" confirmation promised on the
+    call.
+    """
+    to = _recipient_whatsapp_number(call_phone_number)
+    if not to:
+        logger.warning("Skipping callback WhatsApp: WHATSAPP_RECIPIENT_NUMBER is empty")
+        return False
+
+    your_name = _template_variable(_safe_env("YOUR_NAME", "Vara Prasad"), "Vara Prasad")
+    your_phone = _fmt_phone(_safe_env("YOUR_PHONE_NUMBER"))
+    try:
+        from_ = _from_whatsapp_number()
+        payload = {
+            "1": your_name,
+            "2": _callback_template_message(context, confirmation, caller_name),
+            "3": _template_variable(your_phone, "+91 7658975169"),
+        }
+        await _send_template(MID_CALL_TEMPLATE_SID, payload, to, from_)
+        return True
+    except Exception:
+        logger.exception("Callback WhatsApp send failed")
+        return False
+
+
+async def send_mid_call_message(
+    context: str, tone: str, caller_name: str = "", call_phone_number: str = ""
+) -> bool:
     """Send the template-based mid-call WhatsApp follow-up while the call is live."""
-    to = _recipient_whatsapp_number()
+    to = _recipient_whatsapp_number(call_phone_number)
     if not to:
         logger.warning("Skipping mid-call WhatsApp: WHATSAPP_RECIPIENT_NUMBER is empty")
         return False
@@ -176,9 +232,10 @@ async def send_post_call_summary(
     call_context_paragraph: str,
     classification: str,
     caller_name: str = "",
+    call_phone_number: str = "",
 ) -> bool:
     """Send the template-based post-call WhatsApp summary after the call ends."""
-    to = _recipient_whatsapp_number()
+    to = _recipient_whatsapp_number(call_phone_number)
     if not to:
         logger.warning("Skipping post-call WhatsApp: WHATSAPP_RECIPIENT_NUMBER is empty")
         return False

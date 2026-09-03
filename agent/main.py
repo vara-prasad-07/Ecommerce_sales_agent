@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import uuid
+from datetime import datetime
 
 from dotenv import load_dotenv
 import httpx
@@ -367,10 +368,11 @@ class ElevateBoxSalesAgent(Agent):
     decides when to call them based on the system prompt's instructions.
     """
 
-    def __init__(self, call_id: str, ctx: JobContext) -> None:
+    def __init__(self, call_id: str, ctx: JobContext, phone_number: str = "") -> None:
         super().__init__(instructions=build_system_prompt())
         self.call_id = call_id
         self.job_ctx = ctx
+        self._phone_number = phone_number
         self._last_classification = "unclassified"
         self._summary_sent = False
         self._hangup_requested = False
@@ -453,7 +455,9 @@ class ElevateBoxSalesAgent(Agent):
         self._mid_call_tones_sent.add(tone)
 
         async def _fire():
-            success = await whatsapp.send_mid_call_message(call_context, tone, self._caller_name)
+            success = await whatsapp.send_mid_call_message(
+                call_context, tone, self._caller_name, self._phone_number
+            )
             await storage.record_whatsapp_send(
                 self.call_id,
                 "mid_call",
@@ -461,6 +465,38 @@ class ElevateBoxSalesAgent(Agent):
                 success,
             )
             logger.info("Mid-call WhatsApp completed (success=%s, tone=%s)", success, tone)
+
+        task = asyncio.create_task(_fire())
+        self._whatsapp_tasks.add(task)
+        task.add_done_callback(self._whatsapp_tasks.discard)
+
+    def _schedule_callback_whatsapp(self, natural_time_phrase: str, confirmation: str) -> None:
+        """Fire the "I'll send follow-up details" WhatsApp for a Warm caller
+        who asked for a callback instead of continuing the pitch. Unlike
+        `_schedule_mid_call_whatsapp`, this does not wait on discovery being
+        complete — a caller who says "I don't have time, call me later" may
+        bail out before discovery finishes, and still needs the confirmation
+        they were just promised on the call."""
+        if self._mid_call_whatsapp_sent:
+            logger.info("Skipping callback WhatsApp: mid-call WhatsApp already sent for this call")
+            return
+
+        self._mid_call_whatsapp_sent = True
+        self._mid_call_tones_sent.add("callback")
+
+        call_context = self._discovery_context()
+
+        async def _fire():
+            success = await whatsapp.send_callback_confirmation(
+                call_context, confirmation, self._caller_name, self._phone_number
+            )
+            await storage.record_whatsapp_send(
+                self.call_id,
+                "mid_call_callback",
+                {"context": call_context, "time_phrase": natural_time_phrase, "confirmation": confirmation},
+                success,
+            )
+            logger.info("Callback WhatsApp completed (success=%s)", success)
 
         task = asyncio.create_task(_fire())
         self._whatsapp_tasks.add(task)
@@ -604,8 +640,10 @@ class ElevateBoxSalesAgent(Agent):
         natural_time_phrase: str,
     ) -> str:
         """
-        Parse a spoken time phrase into an actual callback datetime and
-        record it.
+        Parse a spoken time phrase into an actual callback datetime, record
+        it, and fire the "I'll send follow-up details" WhatsApp
+        confirmation (template 1) in the background. Do not also call
+        send_whatsapp_now for this lead — this tool already sends it.
 
         Args:
             natural_time_phrase: the caller's own words, e.g.
@@ -617,7 +655,12 @@ class ElevateBoxSalesAgent(Agent):
         )
         confirmation = format_confirmation(parsed)
         logger.info("Callback booked: '%s' -> %s", natural_time_phrase, parsed.isoformat())
-        return f"Callback booked for {confirmation}. Confirm this back to the caller."
+        self._schedule_callback_whatsapp(natural_time_phrase, confirmation)
+        return (
+            f"Callback booked for {confirmation}. A WhatsApp confirmation is being sent now. "
+            "Confirm the time back to the caller, mention the WhatsApp is on its way, then wrap "
+            "up: call end_call_summary and hang_up."
+        )
 
     # ---- Tool: end_call_summary ----
     @function_tool
@@ -644,6 +687,12 @@ class ElevateBoxSalesAgent(Agent):
         structured = self._discovery_context()
         if structured:
             context_paragraph = f"On the call we covered — {structured}."
+        elif callback and callback.get("raw_phrase"):
+            # No discovery to summarize (e.g. caller said "I don't have
+            # time" before we got anywhere) — say that plainly instead of
+            # dumping the raw "Agent: ... Caller: ..." transcript into the
+            # message. A pasted log fails "written like a person" review.
+            context_paragraph = "We didn't get into the details on this call since it wasn't a good time to talk."
         else:
             raw_context = await self._get_transcript_context()
             context_paragraph = (
@@ -653,10 +702,15 @@ class ElevateBoxSalesAgent(Agent):
             )
 
         if callback and callback.get("raw_phrase"):
-            context_paragraph += f" They asked for a callback: {callback['raw_phrase']}."
+            try:
+                callback_dt = datetime.fromisoformat(callback["parsed_datetime_iso"])
+                confirmation = format_confirmation(callback_dt)
+            except (KeyError, TypeError, ValueError):
+                confirmation = callback["raw_phrase"]
+            context_paragraph += f" I'll call you back {confirmation} like we agreed."
 
         success = await whatsapp.send_post_call_summary(
-            context_paragraph, classification, self._caller_name
+            context_paragraph, classification, self._caller_name, self._phone_number
         )
         await storage.record_whatsapp_send(
             self.call_id,
@@ -749,7 +803,7 @@ async def entrypoint(ctx: JobContext):
         tts=tts,
     )
 
-    agent = ElevateBoxSalesAgent(call_id=call_id, ctx=ctx)
+    agent = ElevateBoxSalesAgent(call_id=call_id, ctx=ctx, phone_number=phone_number)
 
     # Log every turn to storage so end_call_summary can build real context
     pending_turns = set()
@@ -800,6 +854,8 @@ async def entrypoint(ctx: JobContext):
                 )
 
     async def _on_shutdown():
+        if not watchdog_task.done():
+            watchdog_task.cancel()
         if pending_turns:
             await asyncio.gather(*pending_turns, return_exceptions=True)
         await agent._wait_for_whatsapp()
@@ -807,6 +863,24 @@ async def entrypoint(ctx: JobContext):
         await storage.end_call(call_id)
 
     ctx.add_shutdown_callback(_on_shutdown)
+
+    # Safety net: if the LLM books a callback (or otherwise ends the useful
+    # part of the conversation) and never calls hang_up, the call stays live
+    # and keeps burning Twilio minutes. Force it closed after a generous
+    # ceiling rather than trusting tool-call compliance alone.
+    max_call_seconds = float(os.getenv("MAX_CALL_DURATION_SECONDS", "360"))
+
+    async def _call_duration_watchdog():
+        await asyncio.sleep(max_call_seconds)
+        if not agent._hangup_requested:
+            logger.warning(
+                "Call exceeded %.0fs without hang_up being called — forcing hangup",
+                max_call_seconds,
+            )
+            agent._hangup_requested = True
+            agent._schedule_hangup(None)
+
+    watchdog_task = asyncio.create_task(_call_duration_watchdog())
 
     await session.start(room=ctx.room, agent=agent)
 

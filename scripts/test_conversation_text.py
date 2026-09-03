@@ -22,6 +22,7 @@ import os
 import json
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -31,7 +32,7 @@ from openai import AsyncOpenAI
 
 from agent.prompts import build_system_prompt
 from agent import storage
-from agent.whatsapp import send_mid_call_message, send_post_call_summary
+from agent.whatsapp import send_mid_call_message, send_post_call_summary, send_callback_confirmation
 from agent.scheduling import parse_callback_time, format_confirmation
 from agent.main import classify_caller_turn, LANGUAGE_TURN_HINTS, _clean_discovery_value
 
@@ -124,6 +125,14 @@ TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "hang_up",
+            "description": "End the call after the final goodbye has finished playing.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 
@@ -164,11 +173,15 @@ async def handle_tool_call(
         return f"Classification recorded: {args['status']}"
 
     if name == "send_whatsapp_now":
+        if state.get("mid_call_whatsapp_sent"):
+            print("   [TOOL] send_whatsapp_now -> skipped, mid-call WhatsApp already sent")
+            return "Mid-call WhatsApp was already sent for this call; no duplicate send."
         structured = discovery_context(discovery)
         call_context = f"{structured} — {args['call_context']}" if structured else args["call_context"]
         print(f"   [TOOL] send_whatsapp_now -> tone={args['tone']}")
         print(f"          context: {call_context}")
         success = await send_mid_call_message(call_context, args["tone"], state["caller_name"])
+        state["mid_call_whatsapp_sent"] = True
         print(f"          Twilio accepted request: {success}")
         return (
             "Twilio accepted the WhatsApp request; delivery status will be visible in Twilio."
@@ -181,23 +194,58 @@ async def handle_tool_call(
         confirmation = format_confirmation(parsed)
         await storage.record_callback(call_id, args["natural_time_phrase"], parsed.isoformat())
         print(f"   [TOOL] book_callback -> '{args['natural_time_phrase']}' => {confirmation}")
-        return f"Callback booked for {confirmation}."
+
+        # Mirrors agent/main.py's book_callback: fires the "I'll send
+        # follow-up details" WhatsApp (template 1) right away, without
+        # waiting on discovery to be complete — a caller booking a callback
+        # instead of continuing the pitch may never answer discovery at all.
+        if state.get("mid_call_whatsapp_sent"):
+            print("   [TOOL] (callback WhatsApp skipped, mid-call WhatsApp already sent)")
+        else:
+            structured = discovery_context(discovery)
+            success = await send_callback_confirmation(structured, confirmation, state["caller_name"])
+            state["mid_call_whatsapp_sent"] = True
+            print(f"   [TOOL] callback WhatsApp (template 1) sent: {success}")
+
+        return f"Callback booked for {confirmation}. A WhatsApp confirmation is being sent now."
 
     if name == "end_call_summary":
         print("   [TOOL] end_call_summary -> sending post-call WhatsApp")
         call = await storage.get_call(call_id)
         classification = call["current_classification"] if call else "unclassified"
+        callback = await storage.get_latest_callback(call_id)
         structured = discovery_context(discovery)
-        context_paragraph = (
-            f"On the call we covered — {structured}."
-            if structured
-            else transcript_so_far[-800:]
-        )
+
+        if structured:
+            context_paragraph = f"On the call we covered — {structured}."
+        elif callback and callback.get("raw_phrase"):
+            # No discovery captured (e.g. caller said "I don't have time")
+            # -- say that plainly instead of pasting the raw transcript.
+            context_paragraph = "We didn't get into the details on this call since it wasn't a good time to talk."
+        else:
+            context_paragraph = (
+                transcript_so_far[-800:]
+                if transcript_so_far
+                else "We had a good initial conversation about building an e-commerce site."
+            )
+
+        if callback and callback.get("raw_phrase"):
+            try:
+                confirmation = format_confirmation(datetime.fromisoformat(callback["parsed_datetime_iso"]))
+            except (KeyError, TypeError, ValueError):
+                confirmation = callback["raw_phrase"]
+            context_paragraph += f" I'll call you back {confirmation} like we agreed."
+
         success = await send_post_call_summary(
             context_paragraph, classification, state["caller_name"]
         )
         print(f"          sent: {success}")
         return "Summary sent."
+
+    if name == "hang_up":
+        state["should_end"] = True
+        print("   [TOOL] hang_up -> call would end here")
+        return "Goodbye. The call will end after this final message."
 
     return "Unknown tool."
 
@@ -246,6 +294,8 @@ async def main():
                     "tool_call_id": tc.id,
                     "content": result,
                 })
+            if state.get("should_end"):
+                break
             continue  # let the model react to tool results before waiting for user input
 
         user_input = input("\nYOU: ")
