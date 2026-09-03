@@ -383,6 +383,7 @@ class ElevateBoxSalesAgent(Agent):
         self._whatsapp_tasks = set()
         self._discovery: dict[str, str] = {field: "" for field in DISCOVERY_FIELDS}
         self._caller_name = ""
+        self._classification_reasoning = ""
 
     async def on_user_turn_completed(
         self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage
@@ -502,6 +503,32 @@ class ElevateBoxSalesAgent(Agent):
         self._whatsapp_tasks.add(task)
         task.add_done_callback(self._whatsapp_tasks.discard)
 
+    async def _try_fire_mid_call(self) -> None:
+        """Fire the mid-call (template 1) WhatsApp the moment BOTH a hot/cold
+        classification and sufficient discovery exist, regardless of which
+        one completed first.
+
+        A real Hot caller often asks about price on the very first answer —
+        classify_lead("hot") can fire long before update_discovery has 4/5
+        fields. The old code only attempted the send at the instant
+        classify_lead/send_whatsapp_now was called, so a too-early
+        classification silently dropped the send forever (nothing retried it
+        once discovery caught up) — the caller only ever got the unconditional
+        post-call summary (template 2) at hangup. Calling this from the tail
+        of both update_discovery and classify_lead makes the send
+        order-independent and guarantees it fires exactly once per call.
+        """
+        if self._mid_call_whatsapp_sent:
+            return
+        if self._last_classification not in ("hot", "cold"):
+            return
+
+        call_context = await self._resolve_call_context(self._classification_reasoning)
+        if not (self._discovery_complete() or _has_required_discovery(call_context)):
+            return
+
+        self._schedule_mid_call_whatsapp(call_context, self._last_classification)
+
     # ---- Tool: record_caller_name ----
     @function_tool
     async def record_caller_name(self, context: RunContext, name: str) -> str:
@@ -556,6 +583,12 @@ class ElevateBoxSalesAgent(Agent):
         await storage.set_discovery(self.call_id, self._discovery)
         filled = self._discovery_filled_count()
         logger.info("Discovery updated (%d/5 fields): %s", filled, self._discovery)
+
+        # Discovery may be what was missing for a classification that
+        # already fired earlier — check now rather than waiting on the LLM
+        # to call send_whatsapp_now again (which the prompt tells it not to).
+        await self._try_fire_mid_call()
+
         return f"Discovery recorded ({filled}/5 fields captured)."
 
     # ---- Tool: classify_lead ----
@@ -578,13 +611,11 @@ class ElevateBoxSalesAgent(Agent):
             status = "warm"  # safe default rather than erroring the call
         self._classification_count += 1
         self._last_classification = status
+        self._classification_reasoning = reasoning
         await storage.set_classification(self.call_id, status, reasoning)
         logger.info("Lead classified as %s — %s", status, reasoning)
 
-        if status in ("hot", "cold") and not self._mid_call_whatsapp_sent:
-            call_context = await self._resolve_call_context(reasoning)
-            if self._discovery_complete() or _has_required_discovery(call_context):
-                self._schedule_mid_call_whatsapp(call_context, status)
+        await self._try_fire_mid_call()
 
         return f"Classification recorded: {status}"
 
@@ -612,6 +643,17 @@ class ElevateBoxSalesAgent(Agent):
 
         if self._mid_call_whatsapp_sent:
             return "Mid-call WhatsApp was already sent for this call; no duplicate send."
+
+        # In case classify_lead already recorded this tone and discovery is
+        # now sufficient, this alone can satisfy the send — avoids rejecting
+        # a call that's actually ready just because this path re-derives
+        # discovery-completeness slightly differently below.
+        if self._last_classification == "unclassified":
+            self._last_classification = tone
+            self._classification_reasoning = call_context
+        await self._try_fire_mid_call()
+        if self._mid_call_whatsapp_sent:
+            return "WhatsApp message is being sent now in the background."
 
         if self._discovery_complete():
             # Structured discovery wins — it's language-agnostic and always
