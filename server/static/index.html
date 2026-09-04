@@ -48,7 +48,7 @@
   }
   .card {
     width: 100%;
-    max-width: 420px;
+    max-width: 480px;
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: 14px;
@@ -120,6 +120,58 @@
     font-size: 0.78rem;
     margin: -12px 0 18px;
   }
+  .details {
+    display: none;
+    margin-top: 24px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+  }
+  .details.visible { display: block; }
+  .details h2 {
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin: 0 0 12px;
+  }
+  .meta-line {
+    font-size: 0.88rem;
+    margin: 0 0 18px;
+    line-height: 1.6;
+  }
+  .meta-line b { font-weight: 600; }
+  .whatsapp-list {
+    list-style: none;
+    margin: 0 0 20px;
+    padding: 0;
+    font-size: 0.85rem;
+  }
+  .whatsapp-list li {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .whatsapp-list li:last-child { border-bottom: none; }
+  .whatsapp-list .ok { color: var(--success); }
+  .whatsapp-list .fail { color: var(--error); }
+  .empty-note {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin: 0 0 20px;
+  }
+  .transcript {
+    max-height: 260px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 0.85rem;
+  }
+  .transcript .turn { margin-bottom: 8px; line-height: 1.45; }
+  .transcript .turn:last-child { margin-bottom: 0; }
+  .transcript .role { font-weight: 600; }
 </style>
 </head>
 <body>
@@ -139,6 +191,19 @@
     </form>
 
     <div id="status" class="status" role="status"></div>
+
+    <div id="details" class="details">
+      <h2>Call details</h2>
+      <p id="meta-line" class="meta-line"></p>
+
+      <h2>WhatsApp triggers</h2>
+      <ul id="whatsapp-list" class="whatsapp-list"></ul>
+      <p id="whatsapp-empty" class="empty-note">No WhatsApp messages sent yet.</p>
+
+      <h2>Transcript</h2>
+      <div id="transcript" class="transcript"></div>
+      <p id="transcript-empty" class="empty-note">No transcript yet.</p>
+    </div>
   </div>
 
   <script>
@@ -146,9 +211,140 @@
     const statusEl = document.getElementById("status");
     const submitBtn = document.getElementById("submit-btn");
 
+    const detailsEl = document.getElementById("details");
+    const metaLineEl = document.getElementById("meta-line");
+    const whatsappListEl = document.getElementById("whatsapp-list");
+    const whatsappEmptyEl = document.getElementById("whatsapp-empty");
+    const transcriptEl = document.getElementById("transcript");
+    const transcriptEmptyEl = document.getElementById("transcript-empty");
+
+    let pollTimer = null;
+
     function showStatus(kind, message) {
       statusEl.className = "status " + kind;
       statusEl.textContent = message;
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement("div");
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    function stopPolling() {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    function formatDuration(totalSeconds) {
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = Math.round(totalSeconds % 60);
+      return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+    }
+
+    function formatTime(unixSeconds) {
+      return new Date(unixSeconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    }
+
+    function resetDetails() {
+      detailsEl.classList.add("visible");
+      metaLineEl.textContent = "Waiting for the call to connect…";
+      whatsappListEl.innerHTML = "";
+      whatsappEmptyEl.style.display = "block";
+      transcriptEl.innerHTML = "";
+      transcriptEmptyEl.style.display = "block";
+    }
+
+    function renderDetails(data) {
+      if (data.status === "pending") {
+        metaLineEl.textContent = "Waiting for the call to connect…";
+        return;
+      }
+
+      const parts = [`<b>${data.phone_number}</b>`];
+      if (data.classification && data.classification !== "unclassified") {
+        parts.push(`classified <b>${data.classification}</b>`);
+      }
+      if (data.status === "ended") {
+        parts.push(data.duration_seconds != null
+          ? `call lasted <b>${formatDuration(data.duration_seconds)}</b>`
+          : "call ended");
+      } else {
+        parts.push("call in progress…");
+      }
+      metaLineEl.innerHTML = parts.join(" &middot; ");
+
+      if (data.whatsapp_sends && data.whatsapp_sends.length > 0) {
+        whatsappEmptyEl.style.display = "none";
+        whatsappListEl.innerHTML = data.whatsapp_sends.map((w) => `
+          <li>
+            <span>${w.label}</span>
+            <span class="${w.success ? "ok" : "fail"}">${w.success ? "✓ sent" : "✗ failed"} &middot; ${formatTime(w.sent_at)}</span>
+          </li>
+        `).join("");
+      } else {
+        whatsappEmptyEl.style.display = "block";
+        whatsappListEl.innerHTML = "";
+      }
+
+      if (data.transcript && data.transcript.length > 0) {
+        transcriptEmptyEl.style.display = "none";
+        transcriptEl.innerHTML = data.transcript.map((t) => `
+          <div class="turn"><span class="role">${t.role === "agent" ? "Agent" : "Caller"}:</span> ${escapeHtml(t.text)}</div>
+        `).join("");
+        transcriptEl.scrollTop = transcriptEl.scrollHeight;
+      } else {
+        transcriptEmptyEl.style.display = "block";
+        transcriptEl.innerHTML = "";
+      }
+
+      if (data.status === "ended") {
+        stopPolling();
+      }
+    }
+
+    let consecutiveFailures = 0;
+
+    async function pollStatus(room, password) {
+      try {
+        const response = await fetch(`/api/call/${encodeURIComponent(room)}`, {
+          headers: { "X-Call-Password": password },
+        });
+        if (response.status === 401) {
+          // Genuinely fatal — the password is wrong, retrying won't help.
+          stopPolling();
+          metaLineEl.textContent = "Could not load call details: incorrect password.";
+          return;
+        }
+        if (!response.ok) {
+          // Anything else (a restarting dev server, a transient 5xx) is
+          // worth retrying rather than freezing the panel silently forever.
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= 5) {
+            stopPolling();
+            metaLineEl.textContent = "Lost contact with the server. Refresh the page to check again.";
+          }
+          return;
+        }
+        consecutiveFailures = 0;
+        renderDetails(await response.json());
+      } catch (err) {
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= 5) {
+          stopPolling();
+          metaLineEl.textContent = "Lost contact with the server. Refresh the page to check again.";
+        }
+      }
+    }
+
+    function startPolling(room, password) {
+      stopPolling();
+      resetDetails();
+      consecutiveFailures = 0;
+      pollStatus(room, password);
+      pollTimer = setInterval(() => pollStatus(room, password), 3000);
     }
 
     form.addEventListener("submit", async (event) => {
@@ -173,6 +369,7 @@
         } else {
           showStatus("success", data.message);
           document.getElementById("password").value = "";
+          startPolling(data.room, password);
         }
       } catch (err) {
         showStatus("error", "Could not reach the server. Try again.");

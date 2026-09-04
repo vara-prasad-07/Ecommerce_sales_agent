@@ -32,7 +32,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, field_validator
 
@@ -86,15 +86,26 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+def _check_password(password: str) -> None:
+    expected_password = os.getenv("CALL_TRIGGER_PASSWORD", "")
+    if not expected_password:
+        raise HTTPException(status_code=500, detail="Server is not configured (missing password).")
+    if not hmac.compare_digest(password or "", expected_password):
+        raise HTTPException(status_code=401, detail="Incorrect password.")
+
+
+WHATSAPP_KIND_LABELS = {
+    "mid_call": "Mid-call update",
+    "mid_call_callback": "Callback confirmation",
+    "post_call_summary": "Post-call summary",
+}
+
+
 @app.post("/api/call")
 async def trigger_call(payload: CallRequest, request: Request) -> JSONResponse:
     global _last_trigger_at
 
-    expected_password = os.getenv("CALL_TRIGGER_PASSWORD", "")
-    if not expected_password:
-        raise HTTPException(status_code=500, detail="Server is not configured (missing password).")
-    if not hmac.compare_digest(payload.password, expected_password):
-        raise HTTPException(status_code=401, detail="Incorrect password.")
+    _check_password(payload.password)
 
     min_seconds_between_calls = float(os.getenv("MIN_SECONDS_BETWEEN_CALLS", "30"))
     now = time.monotonic()
@@ -127,5 +138,49 @@ async def trigger_call(payload: CallRequest, request: Request) -> JSONResponse:
             "phone_number": payload.phone_number,
             "room": result["room_name"],
             "message": f"Calling {payload.phone_number} now. It should ring shortly.",
+        }
+    )
+
+
+@app.get("/api/call/{room_name}")
+async def call_status(room_name: str, x_call_password: str = Header(default="")) -> JSONResponse:
+    """Poll target for the frontend: transcript, duration, and WhatsApp
+    sends for the call dispatched into this room. Password travels as a
+    header (not a query param) so it doesn't land in server access logs.
+
+    The agent worker is a separate process that only writes the `calls` row
+    once it picks up the dispatched job — a poll shortly after /api/call can
+    legitimately find nothing yet, which is reported as "pending", not 404,
+    so the frontend doesn't have to special-case the first couple of polls.
+    """
+    _check_password(x_call_password)
+
+    call = await storage.get_call_by_room(room_name)
+    if not call:
+        return JSONResponse({"status": "pending", "room": room_name})
+
+    call_id = call["call_id"]
+    transcript = await storage.get_transcript(call_id)
+    whatsapp_sends = await storage.get_whatsapp_sends(call_id)
+
+    started_at = call["started_at"]
+    ended_at = call["ended_at"]
+
+    return JSONResponse(
+        {
+            "status": "ended" if ended_at else "in_progress",
+            "room": room_name,
+            "phone_number": call["phone_number"],
+            "classification": call["current_classification"],
+            "duration_seconds": round(ended_at - started_at) if (started_at and ended_at) else None,
+            "transcript": [{"role": t["role"], "text": t["text"]} for t in transcript],
+            "whatsapp_sends": [
+                {
+                    "label": WHATSAPP_KIND_LABELS.get(w["kind"], w["kind"]),
+                    "sent_at": w["sent_at"],
+                    "success": bool(w["success"]),
+                }
+                for w in whatsapp_sends
+            ],
         }
     )

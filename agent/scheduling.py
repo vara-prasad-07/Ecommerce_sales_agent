@@ -29,19 +29,56 @@ TIME_OF_DAY_DEFAULTS = {
 }
 
 
+def _parse_vague_count(raw: str) -> int:
+    """"a"/"an" -> 1, "a couple of" -> 2, otherwise the literal number."""
+    raw = raw.strip()
+    if "couple" in raw:
+        return 2
+    if raw in ("a", "an"):
+        return 1
+    return int(raw)
+
+
+_HOURS_RE = re.compile(r"(?:in\s+)?(a\s+couple\s+of|a|an|\d+)\s+hours?")
+_DAYS_RE = re.compile(r"(?:in\s+)?(a\s+couple\s+of|a|\d+)\s+days?")
+
+
 def parse_callback_time(phrase: str, now: datetime | None = None) -> datetime:
     """
     Best-effort parse of a natural callback phrase into an IST datetime.
     Always returns something usable — never raises.
+
+    Expects the phrase already in English — the calling LLM is instructed
+    (agent/prompts.py) to translate a Hindi/Telugu time reference before
+    passing it here, the same rule already used for update_discovery. This
+    module only needs to resolve common English relative-time patterns
+    reliably, not parse every language itself.
     """
     now = now or datetime.now(IST)
     phrase_lower = phrase.lower().strip()
 
+    # "in 2 hours" / "in a couple of hours" — a direct offset from now,
+    # not a calendar day + time-of-day guess like everything below.
+    hours_match = _HOURS_RE.search(phrase_lower)
+    if hours_match:
+        result = now + timedelta(hours=_parse_vague_count(hours_match.group(1)))
+        return result if result > now else result + timedelta(hours=1)
+
     target_date = now.date()
     target_time = dtime(10, 0)  # default: 10 AM
 
+    days_match = _DAYS_RE.search(phrase_lower)
+
+    # "day after tomorrow" contains the substring "tomorrow", so it must be
+    # checked before the plain "tomorrow" branch or it silently books one
+    # day early.
+    if "day after tomorrow" in phrase_lower:
+        target_date = (now + timedelta(days=2)).date()
+    # "in 3 days" / "in a couple of days"
+    elif days_match:
+        target_date = (now + timedelta(days=_parse_vague_count(days_match.group(1)))).date()
     # explicit "tomorrow"
-    if "tomorrow" in phrase_lower:
+    elif "tomorrow" in phrase_lower:
         target_date = (now + timedelta(days=1)).date()
     # explicit "next week"
     elif "next week" in phrase_lower:

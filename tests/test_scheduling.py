@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from agent.scheduling import parse_callback_time, format_confirmation
@@ -54,6 +54,34 @@ class SchedulingTests(unittest.TestCase):
     def test_format_confirmation_is_human_readable(self):
         dt = datetime(2026, 3, 5, 10, 0, tzinfo=IST)
         self.assertEqual(format_confirmation(dt), "Thursday at 10:00 AM")
+
+    def test_day_after_tomorrow_is_not_swallowed_by_tomorrow(self):
+        """Regression: 'day after tomorrow' contains the substring
+        'tomorrow', so a naive check used to book one day early."""
+        now = datetime(2026, 3, 4, 14, 0, tzinfo=IST)  # Wednesday
+        result = parse_callback_time("day after tomorrow morning", now=now)
+        self.assertEqual(result.date().isoformat(), "2026-03-06")
+        self.assertEqual(result.hour, 10)
+
+    def test_in_n_days(self):
+        now = datetime(2026, 3, 4, 14, 0, tzinfo=IST)
+        result = parse_callback_time("call me in 3 days", now=now)
+        self.assertEqual(result.date().isoformat(), "2026-03-07")
+
+    def test_in_a_couple_of_days(self):
+        now = datetime(2026, 3, 4, 14, 0, tzinfo=IST)
+        result = parse_callback_time("give me a couple of days", now=now)
+        self.assertEqual(result.date().isoformat(), "2026-03-06")
+
+    def test_in_n_hours(self):
+        now = datetime(2026, 3, 4, 14, 0, tzinfo=IST)
+        result = parse_callback_time("call me back in 2 hours", now=now)
+        self.assertEqual(result, now + timedelta(hours=2))
+
+    def test_in_a_couple_of_hours(self):
+        now = datetime(2026, 3, 4, 14, 0, tzinfo=IST)
+        result = parse_callback_time("in a couple of hours", now=now)
+        self.assertEqual(result, now + timedelta(hours=2))
 
 
 if __name__ == "__main__":

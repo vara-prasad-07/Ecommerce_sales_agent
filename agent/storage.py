@@ -11,9 +11,30 @@ import os
 import json
 import time
 import aiosqlite
+from pathlib import Path
 from typing import Optional
 
-DB_PATH = os.getenv("DATABASE_PATH", "./call_data.db")
+# A relative DATABASE_PATH must not resolve against os.getcwd() — the web
+# server, the agent worker, and any one-off script are separate processes,
+# each launched with whatever working directory its shell/launcher happens
+# to have. If their cwd ever differs, a plain relative path silently
+# resolves to a different file per process, so each one thinks it's talking
+# to shared state while actually writing to its own private SQLite file.
+# Anchoring to this file's own location (agent/storage.py, always inside the
+# repo) makes every process agree on the same absolute path regardless of
+# cwd, without requiring DATABASE_PATH to be set to an absolute path.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _resolve_db_path() -> str:
+    raw = os.getenv("DATABASE_PATH", "./call_data.db")
+    path = Path(raw)
+    if not path.is_absolute():
+        path = _PROJECT_ROOT / path
+    return str(path)
+
+
+DB_PATH = _resolve_db_path()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls (
@@ -192,3 +213,32 @@ async def get_call(call_id: str) -> Optional[dict]:
         cursor = await db.execute("SELECT * FROM calls WHERE call_id = ?", (call_id,))
         row = await cursor.fetchone()
         return dict(row) if row else None
+
+
+async def get_call_by_room(room_name: str) -> Optional[dict]:
+    """Look up a call by LiveKit room name rather than call_id.
+
+    server/app.py only knows the room name (assigned by agent/dispatch.py at
+    trigger time) — the call_id itself is generated later, inside the
+    separate agent worker process's entrypoint() once it picks up the job.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM calls WHERE room_name = ? ORDER BY started_at DESC LIMIT 1",
+            (room_name,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_whatsapp_sends(call_id: str) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT kind, sent_at, success FROM whatsapp_sends "
+            "WHERE call_id = ? ORDER BY sent_at ASC",
+            (call_id,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
