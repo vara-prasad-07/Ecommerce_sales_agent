@@ -21,6 +21,7 @@ class TwilioWhatsAppTemplateTests(unittest.TestCase):
         clear=True,
     )
     def test_mid_call_template_uses_twilio_content_variables(self):
+        from agent import whatsapp
         from agent.whatsapp import send_mid_call_message
 
         with patch("agent.whatsapp.Client") as mock_client:
@@ -31,7 +32,7 @@ class TwilioWhatsAppTemplateTests(unittest.TestCase):
             self.assertTrue(success)
             mock_client.assert_called_once_with("AC123", "token123")
             create_kwargs = mock_client.return_value.messages.create.call_args.kwargs
-            self.assertEqual(create_kwargs["content_sid"], "HX0b5ef55c49ac598c27c41aaea7393634")
+            self.assertEqual(create_kwargs["content_sid"], whatsapp.MID_CALL_TEMPLATE_SID)
             self.assertEqual(create_kwargs["from_"], "whatsapp:+14155238886")
             self.assertEqual(create_kwargs["to"], "whatsapp:+917658975169")
             self.assertEqual(
@@ -262,6 +263,7 @@ class TwilioWhatsAppTemplateTests(unittest.TestCase):
         later" and gets a callback booked must still get a WhatsApp
         confirming the follow-up — sent on template 1, the same content SID
         as the Hot/Cold mid-call send."""
+        from agent import whatsapp
         from agent.whatsapp import send_callback_confirmation
 
         with patch("agent.whatsapp.Client") as mock_client:
@@ -273,7 +275,7 @@ class TwilioWhatsAppTemplateTests(unittest.TestCase):
 
             self.assertTrue(success)
             create_kwargs = mock_client.return_value.messages.create.call_args.kwargs
-            self.assertEqual(create_kwargs["content_sid"], "HX0b5ef55c49ac598c27c41aaea7393634")
+            self.assertEqual(create_kwargs["content_sid"], whatsapp.MID_CALL_TEMPLATE_SID)
             variables = json.loads(create_kwargs["content_variables"])
             self.assertTrue(variables["2"].startswith("Hi Ramesh!"))
             self.assertIn("WhatsApp", variables["2"])

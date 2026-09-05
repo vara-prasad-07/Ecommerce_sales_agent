@@ -15,7 +15,7 @@ from twilio.rest import Client
 
 logger = logging.getLogger("whatsapp")
 
-MID_CALL_TEMPLATE_SID = "HX0b5ef55c49ac598c27c41aaea7393634"
+MID_CALL_TEMPLATE_SID = "HX4ef21c8a141b2fa28574d5c1a4e7e31d"  # Utility-approved (was Marketing, silently throttled by Meta — see error 63049)
 POST_CALL_TEMPLATE_SID = "HX2f327669489ed03af33a064ca3485999"
 
 
