@@ -12,6 +12,9 @@ Built for the ElevateBox SDE Intern assignment.
 **Stack:** LiveKit Agents (orchestration) + Sarvam AI (STT, TTS, and the LLM —
 also handles Hindi/Telugu/English) + Twilio (calling + WhatsApp).
 
+Architecture Diagram: https://res.cloudinary.com/diryolcmm/image/upload/v1788351273/final_arch_t8p4oc.png
+
+Live website: https://elevatebox-web.kindisland-53999716.centralindia.azurecontainerapps.io/
 ---
 
 ## Setup
