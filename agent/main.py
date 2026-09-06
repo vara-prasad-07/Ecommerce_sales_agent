@@ -384,6 +384,7 @@ class ElevateBoxSalesAgent(Agent):
         self._discovery: dict[str, str] = {field: "" for field in DISCOVERY_FIELDS}
         self._caller_name = ""
         self._classification_reasoning = ""
+        self._call_connected = False
 
     async def on_user_turn_completed(
         self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage
@@ -717,6 +718,9 @@ class ElevateBoxSalesAgent(Agent):
     async def _send_summary(self):
         if self._summary_sent:
             return
+        if not self._call_connected:
+            logger.info("Skipping post-call summary — the callee never answered")
+            return
 
         call = await storage.get_call(self.call_id)
         classification = call["current_classification"] if call else "unclassified"
@@ -818,7 +822,7 @@ async def entrypoint(ctx: JobContext):
     tts = sarvam.TTS(
         target_language_code=os.getenv("SARVAM_TTS_LANGUAGE", "en-IN"),
         model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
-        speaker=os.getenv("SARVAM_TTS_SPEAKER", "shubh"),
+        speaker=os.getenv("SARVAM_TTS_SPEAKER", "pooja"),
     )
 
     llm_kwargs = {
@@ -846,6 +850,37 @@ async def entrypoint(ctx: JobContext):
     )
 
     agent = ElevateBoxSalesAgent(call_id=call_id, ctx=ctx, phone_number=phone_number)
+
+    # The SIP participant joins the room as soon as the number starts
+    # ringing — NOT once the callee picks up — so "is there a SIP
+    # participant" is not "was the call answered". LiveKit exposes the real
+    # signal as the "sip.callStatus" participant attribute, which only
+    # becomes "active" once the call is actually answered; it stays
+    # "ringing"/"automation"/etc. (never "active") for a declined, busy, or
+    # unanswered call. Used to suppress the post-call WhatsApp summary for
+    # calls nobody answered (see ElevateBoxSalesAgent._send_summary).
+    _SIP_CALL_STATUS_ACTIVE = "active"
+
+    def _check_call_answered(participant: rtc.RemoteParticipant) -> None:
+        if participant.kind != rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+            return
+        if participant.attributes.get("sip.callStatus") == _SIP_CALL_STATUS_ACTIVE:
+            if not agent._call_connected:
+                agent._call_connected = True
+                logger.info("SIP call answered (sip.callStatus=active)")
+
+    def _on_participant_connected(participant: rtc.RemoteParticipant) -> None:
+        _check_call_answered(participant)
+
+    def _on_participant_attributes_changed(
+        changed_attributes: dict, participant: rtc.RemoteParticipant
+    ) -> None:
+        _check_call_answered(participant)
+
+    ctx.room.on("participant_connected", _on_participant_connected)
+    ctx.room.on("participant_attributes_changed", _on_participant_attributes_changed)
+    for existing_participant in ctx.room.remote_participants.values():
+        _check_call_answered(existing_participant)
 
     # Log every turn to storage so end_call_summary can build real context
     pending_turns = set()

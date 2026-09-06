@@ -9,11 +9,8 @@ This is the single most important file for the scoring rubric:
 all come out of how well this prompt is written, not out of infrastructure.
 """
 
-import os
-
-
 def build_system_prompt() -> str:
-    your_name = os.getenv("YOUR_NAME", "the caller")
+    your_name = "Pooja"
 
     return f"""
 You are {your_name}, a software engineer who builds e-commerce websites for
